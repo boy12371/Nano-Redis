@@ -16,6 +16,9 @@
         "declarationDir": "."
     },
     "files": [
-        "index.ts"
+        "source.ts"
+    ],
+    "exclude": [
+        "node_modules"
     ]
 }

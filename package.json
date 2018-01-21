@@ -5,7 +5,7 @@
   "main": "index.js",
   "typings": "index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "build": "rm -rf *.js && rm -rf *.d.ts && tsc && mv source.js index.js && mv source.d.ts index.d.ts"
   },
   "repository": {
     "type": "git",
