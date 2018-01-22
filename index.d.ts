@@ -3,6 +3,7 @@ import { DataModel, NanoSQLInstance } from "nano-sql/lib/index";
 import * as redis from "redis";
 export declare class redisAdapter implements NanoSQLStorageAdapter {
     connectArgs: redis.ClientOpts;
+    multipleDBs: boolean | undefined;
     private _pkKey;
     private _pkType;
     private _doAI;
@@ -13,9 +14,11 @@ export declare class redisAdapter implements NanoSQLStorageAdapter {
     private _filename;
     private _mode;
     private _clientID;
-    constructor(connectArgs: redis.ClientOpts);
+    private _DBIds;
+    constructor(connectArgs: redis.ClientOpts, multipleDBs?: boolean | undefined);
     setID(id: string): void;
     private _key(table, pk);
+    private _select(table);
     connect(complete: () => void): void;
     private _getIndex(table, complete);
     makeTable(tableName: string, dataModels: DataModel[]): void;

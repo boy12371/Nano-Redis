@@ -1,6 +1,6 @@
 import { NanoSQLStorageAdapter, DBKey, DBRow, _NanoSQLStorage } from "nano-sql/lib/database/storage";
 import { DataModel, NanoSQLInstance } from "nano-sql/lib/index";
-import { setFast } from "lie-ts";
+import { setFast, Promise } from "lie-ts";
 import { StdObject, hash, fastALL, fastCHAIN, deepFreeze, uuid, timeid, _assign, generateID, sortedInsert, isAndroid } from "nano-sql/lib/utilities";
 import * as redis from "redis";
 
@@ -40,10 +40,15 @@ export class redisAdapter implements NanoSQLStorageAdapter {
 
     private _clientID: string;
 
-    constructor(public connectArgs: redis.ClientOpts) {
+    private _DBIds: {
+        [table: string]: number;
+    }
+
+    constructor(public connectArgs: redis.ClientOpts, public multipleDBs?: boolean) {
         this._pkKey = {};
         this._pkType = {};
         this._doAI = {};
+        this._DBIds = {};
         this._clientID = uuid();
     }
 
@@ -52,7 +57,22 @@ export class redisAdapter implements NanoSQLStorageAdapter {
     }
 
     private _key(table: string, pk: any) {
-        return this._id + "::" + table + "::" + String(pk);
+        if (this.multipleDBs) {
+            return table + "::" + String(pk);
+        } else {
+            return this._id + "::" + table + "::" + String(pk);
+        }
+        
+    }
+
+    private _select(table: string) {
+        return new Promise((res, rej) => {
+            if (this.multipleDBs) {
+                this._db.select(this._DBIds[table], res);
+            } else {
+                res();
+            }
+        });
     }
 
     public connect(complete: () => void) {
@@ -63,22 +83,53 @@ export class redisAdapter implements NanoSQLStorageAdapter {
 
         fastALL([this._db, this._pub, this._sub], (item, i, done) => {
             item.on("ready", done);
-        }).then(complete);
+        }).then(() => {
+            if (this.multipleDBs) {
+                this._db.get("_db_idx_", (err, result) => {
+                    let dbIDX = result ? JSON.parse(result) : {};
+                    let maxID = Object.keys(dbIDX).reduce((prev, cur) => {
+                        return Math.max(prev, dbIDX[cur]);
+                    }, 0) || 0;
+                    let doUpdate = false;
+                    Object.keys(this._pkKey).forEach((table) => {
+                        const tableKey = this._id + "::" + table;
+                        if (dbIDX[tableKey] !== undefined) {
+                            this._DBIds[table] = dbIDX[tableKey];
+                        } else {
+                            doUpdate = true;
+                            this._DBIds[table] = maxID;
+                            dbIDX[tableKey] = maxID;
+                            maxID++;
+                        }
+                    });
+                    if (doUpdate) {
+                        this._db.set("_db_idx_", JSON.stringify(dbIDX), complete);
+                    } else {
+                        complete();
+                    }
+                });
+            } else {
+                complete();
+            }
+        });
     }
 
     private _getIndex(table: string, complete: (idx: any[]) => void) {
-        const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
+        this._select(table).then(() => {
+            const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
 
-        const indexCallback = (err, keys) => {
-            if (err) {
-                complete([]);
-                return;
+            const indexCallback = (err, keys) => {
+                if (err) {
+                    complete([]);
+                    return;
+                }
+    
+                complete(isNum ? keys.map(k => parseFloat(k)) : keys); 
             }
+    
+            this._db.zrange(this._key(table, "_index"), 0, -1, indexCallback);
+        });
 
-            complete(isNum ? keys.map(k => parseFloat(k)) : keys); 
-        }
-
-        this._db.zrange(this._key(table, "_index"), 0, -1, indexCallback);
     }
 
 
@@ -97,111 +148,127 @@ export class redisAdapter implements NanoSQLStorageAdapter {
 
     public write(table: string, pk: DBKey | null, newData: DBRow, complete: (row: DBRow) => void, skipReadBeforeWrite: boolean): void {
 
-        if (!this._doAI[table]) {
-            pk = pk || generateID(this._pkType[table], 0) as DBKey;
-
-            if (!pk) {
-                throw new Error("Can't add a row without a primary key!");
-            }    
-        }
-
-        const pkKey = this._pkKey[table];
-        const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
-
-        const doInsert = (oldData: any) => {
-            const r = {
-                ...oldData,
-                ...newData,
-                [this._pkKey[table]]: pk
+        this._select(table).then(() => {
+            if (!this._doAI[table]) {
+                pk = pk || generateID(this._pkType[table], 0) as DBKey;
+    
+                if (!pk) {
+                    throw new Error("Can't add a row without a primary key!");
+                }    
             }
-            fastALL([0, 1], (item, i, done) => {
-                if (i === 0) {
-                    this._db.zadd(this._key(table,  "_index"), isNum ? pk as any : 0 , String(pk), done);
-                } else {
-                    this._db.set(this._key(table,  r[pkKey]), JSON.stringify(r), (err, reply) => {
-                        if (err) throw err;
-                        done();
-                    })
+    
+            const pkKey = this._pkKey[table];
+            const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
+    
+            const doInsert = (oldData: any) => {
+                const r = {
+                    ...oldData,
+                    ...newData,
+                    [this._pkKey[table]]: pk
                 }
-            }).then(() => {
-                complete(r);
-            })
-        }
-
-        if (pk) {
-            if (skipReadBeforeWrite) {
-                doInsert({});
-            } else {
-                this.read(table, pk, (row) => {
-                    doInsert(row);
+                fastALL([0, 1], (item, i, done) => {
+                    if (i === 0) {
+                        this._db.zadd(this._key(table,  "_index"), isNum ? pk as any : 0 , String(pk), done);
+                    } else {
+                        this._db.set(this._key(table,  r[pkKey]), JSON.stringify(r), (err, reply) => {
+                            if (err) throw err;
+                            done();
+                        })
+                    }
+                }).then(() => {
+                    complete(r);
+                })
+            }
+    
+            if (pk) {
+                if (skipReadBeforeWrite) {
+                    doInsert({});
+                } else {
+                    this.read(table, pk, (row) => {
+                        doInsert(row);
+                    });
+                }
+            } else { // auto incriment add
+    
+                this._db.incr(this._key(table, "_AI"), (err, result) => {
+                    pk = result as any;
+                    doInsert({});
                 });
             }
-        } else { // auto incriment add
+        });
 
-            this._db.incr(this._key(table, "_AI"), (err, result) => {
-                pk = result as any;
-                doInsert({});
-            });
-        }
     }
 
     public delete(table: string, pk: DBKey, complete: () => void): void {
-        fastALL([0, 1], (item, i, done) => {
-            if (i === 0) {
-                this._db.zrem(this._key(table, "_index"), String(pk), done);
-            } else {
-                this._db.del(this._key(table, pk), done);
-            }
-        }).then(() => {
-            complete();
-        })
+        this._select(table).then(() => {
+            fastALL([0, 1], (item, i, done) => {
+                if (i === 0) {
+                    this._db.zrem(this._key(table, "_index"), String(pk), done);
+                } else {
+                    this._db.del(this._key(table, pk), done);
+                }
+            }).then(() => {
+                complete();
+            })
+        });
+
     }
 
     public batchRead(table: string, pks: DBKey[], callback: (rows: any[]) => void) {
-        const keys = pks.map(k => this._key(table, k));
-        const pkKey = this._pkKey[table];
-
-        this._db.mget(keys, (err, result) => {
-            callback(result && result.length ? result.map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1) : []);
+        this._select(table).then(() => {
+            const keys = pks.map(k => this._key(table, k));
+            const pkKey = this._pkKey[table];
+    
+            this._db.mget(keys, (err, result) => {
+                callback(result && result.length ? result.map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1) : []);
+            });
         });
+
     }
 
 
     public read(table: string, pk: DBKey, callback: (row: DBRow) => void): void {
-        this._db.get(this._key(table, pk), (err, result) => {
-            if (err) throw err;
-            callback(result ? JSON.parse(result) : undefined);
+        this._select(table).then(() => {
+            this._db.get(this._key(table, pk), (err, result) => {
+                if (err) throw err;
+                callback(result ? JSON.parse(result) : undefined);
+            });
         });
+
     }
 
     public _getIndexRange(table: string, complete: (idx: any[]) => void, from?: any, to?: any, usePK?: boolean) {
-        const usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
-        const pkKey = this._pkKey[table];
-        const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
-
-        const queryCallback = (err, reply) => {
-            if (err) {
-                complete([]);
-                return;
+        this._select(table).then(() => {
+            const usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
+            const pkKey = this._pkKey[table];
+            const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
+    
+            const queryCallback = (err, reply) => {
+                if (err) {
+                    complete([]);
+                    return;
+                }
+                complete(reply);
             }
-            complete(reply);
-        }
-
-        if (usefulValues && usePK) {
-            // form pk to pk
-            if (isNum) {
-                this._db.zrangebyscore(this._key(table, "_index"), from, to, queryCallback);
+    
+            if (usefulValues && usePK) {
+                // form pk to pk
+                if (isNum) {
+                    this._db.zrangebyscore(this._key(table, "_index"), from, to, queryCallback);
+                } else {
+                    this._db.zrangebylex(this._key(table, "_index"), `[${from}`, `[${to}`, queryCallback);
+                }
+                
+            } else if (usefulValues) {
+                // limit, offset
+                this._db.zrange(this._key(table, "_index"), from, to, queryCallback);
             } else {
-                this._db.zrangebylex(this._key(table, "_index"), `[${from}`, `[${to}`, queryCallback);
+                // full table scan
+                this._db.zrange(this._key(table, "_index"), 0, -1, queryCallback);
             }
-            
-        } else if (usefulValues) {
-            // limit, offset
-            this._db.zrange(this._key(table, "_index"), from, to, queryCallback);
-        } else {
-            // full table scan
-            this._db.zrange(this._key(table, "_index"), 0, -1, queryCallback);
-        }
+        });
+        
+
     }
 
     public rangeRead(table: string, rowCallback: (row: DBRow, idx: number, nextRow: () => void) => void, complete: () => void, from?: any, to?: any, usePK?: boolean): void {
@@ -209,61 +276,68 @@ export class redisAdapter implements NanoSQLStorageAdapter {
         const usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
         const pkKey = this._pkKey[table];
 
-        this._getIndexRange(table, (index) => {
+        this._select(table).then(() => {
+            this._getIndexRange(table, (index) => {
 
-            index = index.map(k => this._key(table, k));
-
-            const getBatch = (keys: any[], callback: () => void) => {
-                this._db.mget(keys, (err, result) => {
-                    if (err) {
-                        callback();
-                        return;
-                    }
-                    let rows = result.map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1);
-                    let i = 0;
-                    const getRow = () => {
-                        if (rows.length > i) {
-                            rowCallback(rows[i], i, () => {
-                                i++;
-                                i > 1000 ? setFast(getRow) : getRow(); // handle maximum call stack error
-                            });
-                        } else {
+                index = index.map(k => this._key(table, k));
+    
+                const getBatch = (keys: any[], callback: () => void) => {
+                    this._db.mget(keys, (err, result) => {
+                        if (err) {
                             callback();
+                            return;
                         }
-                    };
-                    getRow();
-                });
-            }
-
-            if (index.length < 5000) {
-                getBatch(index, complete);
-            } else {
-                let batchKeys: any[][] = [];
-                let batchKeyIdx = 0;
-                for (let i = 0; i < index.length; i++) {
-                    if (i > 0 && i % 1000 === 0) {
-                        batchKeyIdx++;
-                    }
-                    if (!batchKeys[batchKeyIdx]) {
-                        batchKeys[batchKeyIdx] = [];
-                    }
-                    batchKeys[batchKeyIdx].push(index[i]);
+                        let rows = result.map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1);
+                        let i = 0;
+                        const getRow = () => {
+                            if (rows.length > i) {
+                                rowCallback(rows[i], i, () => {
+                                    i++;
+                                    i > 1000 ? setFast(getRow) : getRow(); // handle maximum call stack error
+                                });
+                            } else {
+                                callback();
+                            }
+                        };
+                        getRow();
+                    });
                 }
-                fastCHAIN(batchKeys, (keys, i, done) => {
-                    getBatch(keys, done);
-                }).then(complete);
-            }
-        }, from, to, usePK);
+    
+                if (index.length < 5000) {
+                    getBatch(index, complete);
+                } else {
+                    let batchKeys: any[][] = [];
+                    let batchKeyIdx = 0;
+                    for (let i = 0; i < index.length; i++) {
+                        if (i > 0 && i % 1000 === 0) {
+                            batchKeyIdx++;
+                        }
+                        if (!batchKeys[batchKeyIdx]) {
+                            batchKeys[batchKeyIdx] = [];
+                        }
+                        batchKeys[batchKeyIdx].push(index[i]);
+                    }
+                    fastCHAIN(batchKeys, (keys, i, done) => {
+                        getBatch(keys, done);
+                    }).then(complete);
+                }
+            }, from, to, usePK);
+        });
+
+
     }
 
     public drop(table: string, callback: () => void): void {
-        this._getIndex(table, (idx) => {
-            this._db.del(this._key(table, "_index"), () => {
-                fastALL(idx, (item, i , done) => {
-                    this._db.del(item, done);
-                }).then(callback);
+        this._select(table).then(() => {
+            this._getIndex(table, (idx) => {
+                this._db.del(this._key(table, "_index"), () => {
+                    fastALL(idx, (item, i , done) => {
+                        this._db.del(item, done);
+                    }).then(callback);
+                });
             });
         });
+
     }
 
     public getIndex(table: string, getLength: boolean, complete: (index) => void): void {
@@ -273,9 +347,18 @@ export class redisAdapter implements NanoSQLStorageAdapter {
     }
 
     public destroy(complete: () => void) {
-        this._db.flushall(() => {
-            complete();
-        })
+        if (this.multipleDBs) {
+            fastALL(Object.keys(this._DBIds), (table, i ,done) => {
+                this._select(table).then(() => {
+                    this._db.flushall(done);
+                });
+            }).then(complete);
+        } else {
+            this._db.flushall(() => {
+                complete();
+            })
+        }
+
     }
 
     public setNSQL(nsql: NanoSQLInstance) {
