@@ -32,6 +32,10 @@ export class redisAdapter implements NanoSQLStorageAdapter {
 
     private _db: redis.RedisClient;
 
+    private _dbClients: {
+        [table: string]: redis.RedisClient;
+    }
+
     private _pub: redis.RedisClient;
     private _sub: redis.RedisClient;
 
@@ -65,17 +69,16 @@ export class redisAdapter implements NanoSQLStorageAdapter {
         
     }
 
-    private _select(table: string) {
-        return new Promise((res, rej) => {
-            if (this.multipleDBs) {
-                this._db.select(this._DBIds[table], res);
-            } else {
-                res();
-            }
-        });
+    private _getDB(table: string): redis.RedisClient {
+        if (this.multipleDBs) {
+            return this._dbClients[table];
+        }
+        return this._db;
     }
 
     public connect(complete: () => void) {
+
+        this._dbClients = {};
 
         this._db = redis.createClient(this.connectArgs);
         this._pub = redis.createClient(this.connectArgs);
@@ -102,10 +105,18 @@ export class redisAdapter implements NanoSQLStorageAdapter {
                             maxID++;
                         }
                     });
+                    const genClients = () => {
+                        fastCHAIN(Object.keys(this._pkKey), (item, i, next) => {
+                            this._dbClients[item] = redis.createClient(this.connectArgs);
+                            this._dbClients[item].on("ready", () => {
+                                this._dbClients[item].select(this._DBIds[item], next);
+                            });
+                        }).then(complete);
+                    }
                     if (doUpdate) {
-                        this._db.set("_db_idx_", JSON.stringify(dbIDX), complete);
+                        this._db.set("_db_idx_", JSON.stringify(dbIDX), genClients);
                     } else {
-                        complete();
+                        genClients();
                     }
                 });
             } else {
@@ -115,7 +126,7 @@ export class redisAdapter implements NanoSQLStorageAdapter {
     }
 
     private _getIndex(table: string, complete: (idx: any[]) => void) {
-        this._select(table).then(() => {
+
             const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
 
             const indexCallback = (err, keys) => {
@@ -127,8 +138,8 @@ export class redisAdapter implements NanoSQLStorageAdapter {
                 complete(isNum ? keys.map(k => parseFloat(k)) : keys); 
             }
     
-            this._db.zrange(this._key(table, "_index"), 0, -1, indexCallback);
-        });
+            this._getDB(table).zrange(this._key(table, "_index"), 0, -1, indexCallback);
+
 
     }
 
@@ -148,7 +159,7 @@ export class redisAdapter implements NanoSQLStorageAdapter {
 
     public write(table: string, pk: DBKey | null, newData: DBRow, complete: (row: DBRow) => void, skipReadBeforeWrite: boolean): void {
 
-        this._select(table).then(() => {
+
             if (!this._doAI[table]) {
                 pk = pk || generateID(this._pkType[table], 0) as DBKey;
     
@@ -168,9 +179,9 @@ export class redisAdapter implements NanoSQLStorageAdapter {
                 }
                 fastALL([0, 1], (item, i, done) => {
                     if (i === 0) {
-                        this._db.zadd(this._key(table,  "_index"), isNum ? pk as any : 0 , String(pk), done);
+                        this._getDB(table).zadd(this._key(table,  "_index"), isNum ? pk as any : 0 , String(pk), done);
                     } else {
-                        this._db.set(this._key(table,  r[pkKey]), JSON.stringify(r), (err, reply) => {
+                        this._getDB(table).set(this._key(table,  r[pkKey]), JSON.stringify(r), (err, reply) => {
                             if (err) throw err;
                             done();
                         })
@@ -190,55 +201,55 @@ export class redisAdapter implements NanoSQLStorageAdapter {
                 }
             } else { // auto incriment add
     
-                this._db.incr(this._key(table, "_AI"), (err, result) => {
+                this._getDB(table).incr(this._key(table, "_AI"), (err, result) => {
                     pk = result as any;
                     doInsert({});
                 });
             }
-        });
+
 
     }
 
     public delete(table: string, pk: DBKey, complete: () => void): void {
-        this._select(table).then(() => {
+
             fastALL([0, 1], (item, i, done) => {
                 if (i === 0) {
-                    this._db.zrem(this._key(table, "_index"), String(pk), done);
+                    this._getDB(table).zrem(this._key(table, "_index"), String(pk), done);
                 } else {
-                    this._db.del(this._key(table, pk), done);
+                    this._getDB(table).del(this._key(table, pk), done);
                 }
             }).then(() => {
                 complete();
             })
-        });
+
 
     }
 
     public batchRead(table: string, pks: DBKey[], callback: (rows: any[]) => void) {
-        this._select(table).then(() => {
+
             const keys = pks.map(k => this._key(table, k));
             const pkKey = this._pkKey[table];
     
-            this._db.mget(keys, (err, result) => {
+            this._getDB(table).mget(keys, (err, result) => {
                 callback(result && result.length ? result.map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1) : []);
             });
-        });
+
 
     }
 
 
     public read(table: string, pk: DBKey, callback: (row: DBRow) => void): void {
-        this._select(table).then(() => {
-            this._db.get(this._key(table, pk), (err, result) => {
+
+            this._getDB(table).get(this._key(table, pk), (err, result) => {
                 if (err) throw err;
                 callback(result ? JSON.parse(result) : undefined);
             });
-        });
+
 
     }
 
     public _getIndexRange(table: string, complete: (idx: any[]) => void, from?: any, to?: any, usePK?: boolean) {
-        this._select(table).then(() => {
+
             const usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
             const pkKey = this._pkKey[table];
             const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
@@ -254,19 +265,18 @@ export class redisAdapter implements NanoSQLStorageAdapter {
             if (usefulValues && usePK) {
                 // form pk to pk
                 if (isNum) {
-                    this._db.zrangebyscore(this._key(table, "_index"), from, to, queryCallback);
+                    this._getDB(table).zrangebyscore(this._key(table, "_index"), from, to, queryCallback);
                 } else {
-                    this._db.zrangebylex(this._key(table, "_index"), `[${from}`, `[${to}`, queryCallback);
+                    this._getDB(table).zrangebylex(this._key(table, "_index"), `[${from}`, `[${to}`, queryCallback);
                 }
                 
             } else if (usefulValues) {
                 // limit, offset
-                this._db.zrange(this._key(table, "_index"), from, to, queryCallback);
+                this._getDB(table).zrange(this._key(table, "_index"), from, to, queryCallback);
             } else {
                 // full table scan
-                this._db.zrange(this._key(table, "_index"), 0, -1, queryCallback);
+                this._getDB(table).zrange(this._key(table, "_index"), 0, -1, queryCallback);
             }
-        });
         
 
     }
@@ -276,13 +286,13 @@ export class redisAdapter implements NanoSQLStorageAdapter {
         const usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
         const pkKey = this._pkKey[table];
 
-        this._select(table).then(() => {
+
             this._getIndexRange(table, (index) => {
 
                 index = index.map(k => this._key(table, k));
     
                 const getBatch = (keys: any[], callback: () => void) => {
-                    this._db.mget(keys, (err, result) => {
+                    this._getDB(table).mget(keys, (err, result) => {
                         if (err) {
                             callback();
                             return;
@@ -322,21 +332,19 @@ export class redisAdapter implements NanoSQLStorageAdapter {
                     }).then(complete);
                 }
             }, from, to, usePK);
-        });
 
 
     }
 
     public drop(table: string, callback: () => void): void {
-        this._select(table).then(() => {
+
             this._getIndex(table, (idx) => {
-                this._db.del(this._key(table, "_index"), () => {
+                this._getDB(table).del(this._key(table, "_index"), () => {
                     fastALL(idx, (item, i , done) => {
-                        this._db.del(item, done);
+                        this._getDB(table).del(item, done);
                     }).then(callback);
                 });
             });
-        });
 
     }
 
@@ -349,9 +357,7 @@ export class redisAdapter implements NanoSQLStorageAdapter {
     public destroy(complete: () => void) {
         if (this.multipleDBs) {
             fastALL(Object.keys(this._DBIds), (table, i ,done) => {
-                this._select(table).then(() => {
-                    this._db.flushall(done);
-                });
+                this._getDB(table).flushall(done);
             }).then(complete);
         } else {
             this._db.flushall(() => {

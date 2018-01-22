@@ -9,6 +9,7 @@ export declare class redisAdapter implements NanoSQLStorageAdapter {
     private _doAI;
     private _id;
     private _db;
+    private _dbClients;
     private _pub;
     private _sub;
     private _filename;
@@ -18,7 +19,7 @@ export declare class redisAdapter implements NanoSQLStorageAdapter {
     constructor(connectArgs: redis.ClientOpts, multipleDBs?: boolean | undefined);
     setID(id: string): void;
     private _key(table, pk);
-    private _select(table);
+    private _getDB(table);
     connect(complete: () => void): void;
     private _getIndex(table, complete);
     makeTable(tableName: string, dataModels: DataModel[]): void;
