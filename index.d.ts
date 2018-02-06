@@ -1,7 +1,7 @@
 import { NanoSQLStorageAdapter, DBKey, DBRow } from "nano-sql/lib/database/storage";
 import { DataModel, NanoSQLInstance } from "nano-sql/lib/index";
 import * as redis from "redis";
-export declare class redisAdapter implements NanoSQLStorageAdapter {
+export declare class RedisAdapter implements NanoSQLStorageAdapter {
     connectArgs: redis.ClientOpts;
     multipleDBs: boolean | undefined;
     private _pkKey;

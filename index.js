@@ -10,8 +10,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 var lie_ts_1 = require("lie-ts");
 var utilities_1 = require("nano-sql/lib/utilities");
 var redis = require("redis");
-var redisAdapter = (function () {
-    function redisAdapter(connectArgs, multipleDBs) {
+var RedisAdapter = (function () {
+    function RedisAdapter(connectArgs, multipleDBs) {
         this.connectArgs = connectArgs;
         this.multipleDBs = multipleDBs;
         this._pkKey = {};
@@ -20,10 +20,10 @@ var redisAdapter = (function () {
         this._DBIds = {};
         this._clientID = utilities_1.uuid();
     }
-    redisAdapter.prototype.setID = function (id) {
+    RedisAdapter.prototype.setID = function (id) {
         this._id = id;
     };
-    redisAdapter.prototype._key = function (table, pk) {
+    RedisAdapter.prototype._key = function (table, pk) {
         if (this.multipleDBs) {
             return table + "::" + String(pk);
         }
@@ -31,13 +31,13 @@ var redisAdapter = (function () {
             return this._id + "::" + table + "::" + String(pk);
         }
     };
-    redisAdapter.prototype._getDB = function (table) {
+    RedisAdapter.prototype._getDB = function (table) {
         if (this.multipleDBs) {
             return this._dbClients[table];
         }
         return this._db;
     };
-    redisAdapter.prototype.connect = function (complete) {
+    RedisAdapter.prototype.connect = function (complete) {
         var _this = this;
         this._dbClients = {};
         this._db = redis.createClient(this.connectArgs);
@@ -86,7 +86,7 @@ var redisAdapter = (function () {
             }
         });
     };
-    redisAdapter.prototype._getIndex = function (table, complete) {
+    RedisAdapter.prototype._getIndex = function (table, complete) {
         var isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
         var indexCallback = function (err, keys) {
             if (err) {
@@ -97,7 +97,7 @@ var redisAdapter = (function () {
         };
         this._getDB(table).zrange(this._key(table, "_index"), 0, -1, indexCallback);
     };
-    redisAdapter.prototype.makeTable = function (tableName, dataModels) {
+    RedisAdapter.prototype.makeTable = function (tableName, dataModels) {
         var _this = this;
         dataModels.forEach(function (d) {
             if (d.props && d.props.indexOf("pk") > -1) {
@@ -109,7 +109,7 @@ var redisAdapter = (function () {
             }
         });
     };
-    redisAdapter.prototype.write = function (table, pk, newData, complete, skipReadBeforeWrite) {
+    RedisAdapter.prototype.write = function (table, pk, newData, complete, skipReadBeforeWrite) {
         var _this = this;
         if (!this._doAI[table]) {
             pk = pk || utilities_1.generateID(this._pkType[table], 0);
@@ -154,7 +154,7 @@ var redisAdapter = (function () {
             });
         }
     };
-    redisAdapter.prototype.delete = function (table, pk, complete) {
+    RedisAdapter.prototype.delete = function (table, pk, complete) {
         var _this = this;
         utilities_1.fastALL([0, 1], function (item, i, done) {
             if (i === 0) {
@@ -167,7 +167,7 @@ var redisAdapter = (function () {
             complete();
         });
     };
-    redisAdapter.prototype.batchRead = function (table, pks, callback) {
+    RedisAdapter.prototype.batchRead = function (table, pks, callback) {
         var _this = this;
         var keys = pks.map(function (k) { return _this._key(table, k); });
         var pkKey = this._pkKey[table];
@@ -175,14 +175,14 @@ var redisAdapter = (function () {
             callback(result && result.length ? result.map(function (r) { return JSON.parse(r); }).sort(function (a, b) { return a[pkKey] > b[pkKey] ? 1 : -1; }) : []);
         });
     };
-    redisAdapter.prototype.read = function (table, pk, callback) {
+    RedisAdapter.prototype.read = function (table, pk, callback) {
         this._getDB(table).get(this._key(table, pk), function (err, result) {
             if (err)
                 throw err;
             callback(result ? JSON.parse(result) : undefined);
         });
     };
-    redisAdapter.prototype._getIndexRange = function (table, complete, from, to, usePK) {
+    RedisAdapter.prototype._getIndexRange = function (table, complete, from, to, usePK) {
         var usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
         var pkKey = this._pkKey[table];
         var isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
@@ -208,7 +208,7 @@ var redisAdapter = (function () {
             this._getDB(table).zrange(this._key(table, "_index"), 0, -1, queryCallback);
         }
     };
-    redisAdapter.prototype.rangeRead = function (table, rowCallback, complete, from, to, usePK) {
+    RedisAdapter.prototype.rangeRead = function (table, rowCallback, complete, from, to, usePK) {
         var _this = this;
         var usefulValues = [typeof from, typeof to].indexOf("undefined") === -1;
         var pkKey = this._pkKey[table];
@@ -257,7 +257,7 @@ var redisAdapter = (function () {
             }
         }, from, to, usePK);
     };
-    redisAdapter.prototype.drop = function (table, callback) {
+    RedisAdapter.prototype.drop = function (table, callback) {
         var _this = this;
         this._getIndex(table, function (idx) {
             _this._getDB(table).del(_this._key(table, "_index"), function () {
@@ -267,12 +267,12 @@ var redisAdapter = (function () {
             });
         });
     };
-    redisAdapter.prototype.getIndex = function (table, getLength, complete) {
+    RedisAdapter.prototype.getIndex = function (table, getLength, complete) {
         this._getIndex(table, function (idx) {
             complete(getLength ? idx.length : idx);
         });
     };
-    redisAdapter.prototype.destroy = function (complete) {
+    RedisAdapter.prototype.destroy = function (complete) {
         var _this = this;
         if (this.multipleDBs) {
             utilities_1.fastALL(Object.keys(this._DBIds), function (table, i, done) {
@@ -285,7 +285,7 @@ var redisAdapter = (function () {
             });
         }
     };
-    redisAdapter.prototype.setNSQL = function (nsql) {
+    RedisAdapter.prototype.setNSQL = function (nsql) {
         var _this = this;
         this._sub.on("message", function (channel, msg) {
             if (channel === "nsql") {
@@ -304,6 +304,6 @@ var redisAdapter = (function () {
             }
         });
     };
-    return redisAdapter;
+    return RedisAdapter;
 }());
-exports.redisAdapter = redisAdapter;
+exports.RedisAdapter = RedisAdapter;

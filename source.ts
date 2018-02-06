@@ -12,7 +12,7 @@ import * as redis from "redis";
  * @implements {NanoSQLStorageAdapter}
  */
 // tslint:disable-next-line
-export class redisAdapter implements NanoSQLStorageAdapter {
+export class RedisAdapter implements NanoSQLStorageAdapter {
 
 
     private _pkKey: {
