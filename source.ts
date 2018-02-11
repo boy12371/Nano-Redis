@@ -157,7 +157,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         });
     }
 
-    public write(table: string, pk: DBKey | null, newData: DBRow, complete: (row: DBRow) => void, skipReadBeforeWrite: boolean): void {
+    public write(table: string, pk: DBKey | null, newData: DBRow, complete: (row: DBRow) => void): void {
 
 
             if (!this._doAI[table]) {
@@ -192,13 +192,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
             }
     
             if (pk) {
-                if (skipReadBeforeWrite) {
-                    doInsert({});
-                } else {
-                    this.read(table, pk, (row) => {
-                        doInsert(row);
-                    });
-                }
+                doInsert({});
             } else { // auto incriment add
     
                 this._getDB(table).incr(this._key(table, "_AI"), (err, result) => {

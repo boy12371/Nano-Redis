@@ -23,7 +23,7 @@ export declare class RedisAdapter implements NanoSQLStorageAdapter {
     connect(complete: () => void): void;
     private _getIndex(table, complete);
     makeTable(tableName: string, dataModels: DataModel[]): void;
-    write(table: string, pk: DBKey | null, newData: DBRow, complete: (row: DBRow) => void, skipReadBeforeWrite: boolean): void;
+    write(table: string, pk: DBKey | null, newData: DBRow, complete: (row: DBRow) => void): void;
     delete(table: string, pk: DBKey, complete: () => void): void;
     batchRead(table: string, pks: DBKey[], callback: (rows: any[]) => void): void;
     read(table: string, pk: DBKey, callback: (row: DBRow) => void): void;

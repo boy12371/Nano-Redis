@@ -109,7 +109,7 @@ var RedisAdapter = (function () {
             }
         });
     };
-    RedisAdapter.prototype.write = function (table, pk, newData, complete, skipReadBeforeWrite) {
+    RedisAdapter.prototype.write = function (table, pk, newData, complete) {
         var _this = this;
         if (!this._doAI[table]) {
             pk = pk || utilities_1.generateID(this._pkType[table], 0);
@@ -138,14 +138,7 @@ var RedisAdapter = (function () {
             var _a;
         };
         if (pk) {
-            if (skipReadBeforeWrite) {
-                doInsert({});
-            }
-            else {
-                this.read(table, pk, function (row) {
-                    doInsert(row);
-                });
-            }
+            doInsert({});
         }
         else {
             this._getDB(table).incr(this._key(table, "_AI"), function (err, result) {
