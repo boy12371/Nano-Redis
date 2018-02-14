@@ -87,15 +87,9 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
 
     }
 
-    private _retryCounter: number = 0;
-
     private _getDB(table: string, increaseRetryCounter?: boolean): redis.RedisClient {
         if (this.multipleDBs) {
             return this._dbClients[table];
-        }
-
-        if (!increaseRetryCounter) {
-            this._retryCounter = 0;
         }
 
         const db = this._dbPool[this._poolPtr];
@@ -103,16 +97,6 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         this._poolPtr++;
         if (this._poolPtr >= this._dbPool.length) {
             this._poolPtr = 0;
-        }
-
-        if (!db.connected) {
-            if (increaseRetryCounter) {
-                this._retryCounter++;
-            }
-            if (this._retryCounter > this._dbPool.length) {
-                throw new Error("No active client connections!");
-            }
-            return this._getDB(table, true);
         }
 
         return db;
@@ -125,7 +109,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         if (this.multipleDBs) {
             this._dbPool.push(redis.createClient(this.connectArgs));
         } else {
-            for (let i = 0; i < 30; i++) {
+            for (let i = 0; i < 20; i++) {
                 this._dbPool.push(redis.createClient(this.connectArgs));
             }
         }
@@ -261,7 +245,6 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
                 this._pkType[tableName] = d.type;
                 this._pkKey[tableName] = d.key;
                 if (d.type === "int" && d.props.indexOf("ai") !== -1) {
-                    //this._doAI[tableName] = true;
                     this._dbIndex[tableName].doAI = true;
                 }
             }

@@ -21,7 +21,6 @@ export declare class RedisAdapter implements NanoSQLStorageAdapter {
     constructor(connectArgs: redis.ClientOpts, multipleDBs?: boolean | undefined);
     setID(id: string): void;
     private _key(table, pk);
-    private _retryCounter;
     private _getDB(table, increaseRetryCounter?);
     connect(complete: () => void): void;
     updateIndexes(getThemFast?: boolean): Promise<any>;

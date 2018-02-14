@@ -16,7 +16,6 @@ var RedisAdapter = (function () {
     function RedisAdapter(connectArgs, multipleDBs) {
         this.connectArgs = connectArgs;
         this.multipleDBs = multipleDBs;
-        this._retryCounter = 0;
         if (!this.connectArgs.retry_strategy) {
             this.connectArgs.retry_strategy = function (options) {
                 if (options.error && options.error.code === 'ECONNREFUSED') {
@@ -47,22 +46,10 @@ var RedisAdapter = (function () {
         if (this.multipleDBs) {
             return this._dbClients[table];
         }
-        if (!increaseRetryCounter) {
-            this._retryCounter = 0;
-        }
         var db = this._dbPool[this._poolPtr];
         this._poolPtr++;
         if (this._poolPtr >= this._dbPool.length) {
             this._poolPtr = 0;
-        }
-        if (!db.connected) {
-            if (increaseRetryCounter) {
-                this._retryCounter++;
-            }
-            if (this._retryCounter > this._dbPool.length) {
-                throw new Error("No active client connections!");
-            }
-            return this._getDB(table, true);
         }
         return db;
     };
@@ -74,7 +61,7 @@ var RedisAdapter = (function () {
             this._dbPool.push(redis.createClient(this.connectArgs));
         }
         else {
-            for (var i = 0; i < 30; i++) {
+            for (var i = 0; i < 20; i++) {
                 this._dbPool.push(redis.createClient(this.connectArgs));
             }
         }
