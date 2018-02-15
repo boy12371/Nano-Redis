@@ -52,18 +52,38 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         [table: string]: number;
     }
 
-    constructor(public connectArgs: redis.ClientOpts, public multipleDBs?: boolean) {
+    constructor(public connectArgs: redis.ClientOpts, public opts?: {
+        multipleDBs?: boolean;
+        eventClient?: redis.ClientOpts;
+        events?: string[];
+        poolSize?: boolean;
+        batchSize?: number;
+    }) {
+
+        const retryStrategy = (options) => {
+            if (options.error && options.error.code === 'ECONNREFUSED') {
+                // End reconnecting on a specific error and flush all commands with
+                // a individual error
+                return new Error('The server refused the connection');
+            }
+            // attempt reconnect forever, every 5 seconds at most
+            return Math.min(options.attempt * 100, 5000);
+        };
 
         if (!this.connectArgs.retry_strategy) {
-            this.connectArgs.retry_strategy = (options) => {
-                if (options.error && options.error.code === 'ECONNREFUSED') {
-                    // End reconnecting on a specific error and flush all commands with
-                    // a individual error
-                    return new Error('The server refused the connection');
-                }
-                // attempt reconnect forever, every 5 seconds at most
-                return Math.min(options.attempt * 100, 5000);
-            }
+            this.connectArgs.retry_strategy = retryStrategy;
+        }
+
+        if (this.connectArgs.enable_offline_queue === undefined) {
+            this.connectArgs.enable_offline_queue = false;
+        }
+
+        if (this.opts && this.opts.eventClient && !this.opts.eventClient.retry_strategy) {
+            this.opts.eventClient.retry_strategy = retryStrategy;
+        }
+
+        if (this.opts && this.opts.eventClient && this.opts.eventClient.enable_offline_queue === undefined) {
+            this.opts.eventClient.enable_offline_queue = false;
         }
 
         this._poolPtr = 0;
@@ -79,7 +99,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
     }
 
     private _key(table: string, pk: any) {
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             return table + "::" + String(pk);
         } else {
             return this._id + "::" + table + "::" + String(pk);
@@ -88,7 +108,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
     }
 
     private _getDB(table: string, increaseRetryCounter?: boolean): redis.RedisClient {
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             return this._dbClients[table];
         }
 
@@ -106,32 +126,40 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
 
         this._dbClients = {};
         this._dbPool = [];
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             this._dbPool.push(redis.createClient(this.connectArgs));
         } else {
-            for (let i = 0; i < 20; i++) {
+            const pSize = this.opts && this.opts.poolSize ? this.opts.poolSize : 10;
+            for (let i = 0; i < pSize; i++) {
                 this._dbPool.push(redis.createClient(this.connectArgs));
             }
         }
 
-        this._pub = redis.createClient(this.connectArgs);
-        this._sub = redis.createClient(this.connectArgs);
+        if (this.opts && this.opts.eventClient) {
+            this._pub = redis.createClient(this.opts.eventClient);
+            this._sub = redis.createClient(this.opts.eventClient);
+        } else {
+            this._pub = redis.createClient(this.connectArgs);
+            this._sub = redis.createClient(this.connectArgs);
+        }
+
+
 
         const getIndexes = () => {
             this.updateIndexes(true).then(() => {
                 complete();
 
-                if (this.multipleDBs) {
+                if (this.opts && this.opts.multipleDBs) {
                     this._dbPool[0].quit();
                 }
 
                 // grab a copy of the table indexs every ten minutes
                 // redis pub/sub should gaurantee indexes stay in sync but this is our insurance policy
                 // random hash gaurantees all clients don't hit at the same time
-                const hash = this._clientID.split("").reduce((prev, cur) => prev + cur.charCodeAt(0), 0) % 10;
+                const hash = this._clientID.split("").reduce((prev, cur) => prev + cur.charCodeAt(0), 0) % 59;
 
                 setInterval(() => {
-                    if (new Date().getMinutes() % 10 === hash && new Date().getSeconds() === hash * 5) {
+                    if (new Date().getMinutes() === hash && new Date().getSeconds() === hash) {
                         this.updateIndexes();
                     }
                 }, 1000);
@@ -142,19 +170,12 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         fastALL([this._pub, this._sub].concat(this._dbPool), (item: redis.RedisClient, i, done) => {
             if (item.connected) {
                 done();
+                return;
             } else {
                 item.on("ready", done);
             }
-            const doCheck = () => {
-                if (item.connected) {
-                    done();
-                } else {
-                    setTimeout(doCheck, 50);
-                }
-            }
-            setTimeout(doCheck, 50);
         }).then(() => {
-            if (this.multipleDBs) {
+            if (this.opts && this.opts.multipleDBs) {
                 this._dbPool[0].get("_db_idx_", (err, result) => {
                     let dbIDX = result ? JSON.parse(result) : {};
                     let maxID = Object.keys(dbIDX).reduce((prev, cur) => {
@@ -207,7 +228,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
             });
         } else {
             // non blocking to get the index whenever redis gets around to it.
-            return fastCHAIN(Object.keys(this._dbIndex), (table, i, next) => {
+            return fastALL(Object.keys(this._dbIndex), (table, i, next) => {
 
                 let ptr = "0";
                 let index: any[] = [];
@@ -215,20 +236,23 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
                     this._getDB(table).zscan(this._key(table, "_index"), ptr, (err, result) => {
                         if (err) throw err;
 
-                        if (!result[1].length) {
+                        if (!result[1].length && result[0] !== "0") {
                             ptr = result[0];
                             getNextPage();
+                            return;
                         }
 
                         if (result[0] === "0") {
-                            this._dbIndex[table].set(index.sort((a, b) => a > b ? 1 : -1));
+                            index = index.concat((result[1] || []).filter((v, i) => i % 2 === 0));
+                            index = index.sort((a, b) => a > b ? 1 : -1)
+                            this._dbIndex[table].set(index);
                             next();
                         } else {
                             ptr = result[0];
-                            index = index.concat(result[1].filter((val, i) => i % 2 === 0));
+                            index = index.concat((result[1] || []).filter((v, i) => i % 2 === 0));
                             getNextPage();
                         }
-                    })
+                    });
                 }
                 getNextPage();
             });
@@ -264,13 +288,14 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         const pkKey = this._pkKey[table];
         const isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
 
-        const doInsert = (oldData: any) => {
+        const doInsert = () => {
 
             if (this._dbIndex[table].indexOf(pk) === -1) {
                 this._dbIndex[table].add(pk);
 
                 this._pub.publish("nsql", JSON.stringify({
                     source: this._clientID,
+                    db: this._id,
                     type: "add_idx",
                     event: {
                         table: table,
@@ -282,7 +307,6 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
             this._getDB(table).zadd(this._key(table, "_index"), isNum ? pk as any : 0, String(pk));
 
             const r = {
-                ...oldData,
                 ...newData,
                 [this._pkKey[table]]: pk
             }
@@ -294,12 +318,12 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         }
 
         if (pk) {
-            doInsert({});
+            doInsert();
         } else { // auto incriment add
 
             this._getDB(table).incr(this._key(table, "_AI"), (err, result) => {
                 pk = result as any;
-                doInsert({});
+                doInsert();
             });
         }
 
@@ -314,6 +338,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
 
             this._pub.publish("nsql", JSON.stringify({
                 source: this._clientID,
+                db: this._id,
                 type: "rem_idx",
                 event: {
                     table: table,
@@ -339,7 +364,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
             rows.push(row);
             next();
         }, () => {
-            callback(rows);
+            callback((rows || []).filter(r => r));
         });
     }
 
@@ -428,7 +453,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
                 if (err) {
                     throw err;
                 }
-                let rows = result.map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1);
+                let rows = (result || []).filter(r => r).map(r => JSON.parse(r)).sort((a, b) => a[pkKey] > b[pkKey] ? 1 : -1);
                 if (returnRows) {
                     done(rows);
                     return;
@@ -448,7 +473,9 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
             });
         }
 
-        if (keys.length < 100) {
+        const batchSize:number = this.opts && this.opts.batchSize ? this.opts.batchSize : 100;
+
+        if (keys.length < batchSize) {
             getBatch(keys, callback);
         } else {
             let batchKeys: any[][] = [];
@@ -456,7 +483,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
             batchKeys[0] = [];
 
             for (let i = 0; i < keys.length; i++) {
-                if (i > 0 && i % 100 === 0) {
+                if (i > 0 && i % batchSize === 0) {
                     batchKeyIdx++;
                     batchKeys[batchKeyIdx] = [];
                 }
@@ -493,6 +520,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
 
             this._pub.publish("nsql", JSON.stringify({
                 source: this._clientID,
+                db: this._id,
                 type: "clr_idx",
                 event: {
                     table: table
@@ -511,7 +539,7 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
     }
 
     public destroy(complete: () => void) {
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             fastALL(Object.keys(this._DBIds), (table, i, done) => {
                 this._getDB(table).flushall(done);
             }).then(complete);
@@ -543,36 +571,43 @@ export class RedisAdapter implements NanoSQLStorageAdapter {
         this._sub.on("message", (channel, msg) => {
             const data = JSON.parse(msg);
             if (data.source !== this._clientID) {
-                switch (data.type) {
-                    case "event":
-                        nsql.triggerEvent(data.event);
-                        break;
-                    case "pubsub":
-                        RSE.trigger(data.eventType, data.event);
-                    break;
-                    case "add_idx":
-                        if (!this._dbIndex[data.event.table]) return;
-                        this._dbIndex[data.event.table].add(data.event.key);
-                        break;
-                    case "rem_idx":
-                        if (!this._dbIndex[data.event.table]) return;
-                        this._dbIndex[data.event.table].remove(data.event.key);
-                        break;
-                    case "clr_idx":
-                        if (!this._dbIndex[data.event.table]) return;
-                        let newIndex = new DatabaseIndex();
-                        newIndex.doAI = this._dbIndex[data.event.table].doAI;
-                        this._dbIndex[data.event.table] = newIndex;
-                        break;
+    
+                if (data.type === "pubsub") {
+                    RSE.trigger(data.eventType, data.event);
+                    return;
                 }
+
+                if (data.db === this._id) {
+                    switch (data.type) {
+                        case "event":
+                            nsql.triggerEvent(data.event);
+                            break;
+                        case "add_idx":
+                            if (!this._dbIndex[data.event.table]) return;
+                            this._dbIndex[data.event.table].add(data.event.key);
+                            break;
+                        case "rem_idx":
+                            if (!this._dbIndex[data.event.table]) return;
+                            this._dbIndex[data.event.table].remove(data.event.key);
+                            break;
+                        case "clr_idx":
+                            if (!this._dbIndex[data.event.table]) return;
+                            let newIndex = new DatabaseIndex();
+                            newIndex.doAI = this._dbIndex[data.event.table].doAI;
+                            this._dbIndex[data.event.table] = newIndex;
+                            break;
+                    }
+                }
+
             }
         });
         this._sub.subscribe("nsql");
 
-        nsql.table("*").on("*", (event) => {
+        nsql.table("*").on(this.opts && this.opts.events ? this.opts.events.join(" ") : "change", (event) => {
             if (event.table && event.table.indexOf("_") !== 0) {
                 this._pub.publish("nsql", JSON.stringify({
                     source: this._clientID,
+                    db: this._id,
                     type: "event",
                     event: {
                         ...event,

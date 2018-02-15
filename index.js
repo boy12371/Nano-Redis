@@ -13,16 +13,26 @@ var redis = require("redis");
 var db_idx_1 = require("nano-sql/lib/database/db-idx");
 var really_small_events_1 = require("really-small-events");
 var RedisAdapter = (function () {
-    function RedisAdapter(connectArgs, multipleDBs) {
+    function RedisAdapter(connectArgs, opts) {
         this.connectArgs = connectArgs;
-        this.multipleDBs = multipleDBs;
+        this.opts = opts;
+        var retryStrategy = function (options) {
+            if (options.error && options.error.code === 'ECONNREFUSED') {
+                return new Error('The server refused the connection');
+            }
+            return Math.min(options.attempt * 100, 5000);
+        };
         if (!this.connectArgs.retry_strategy) {
-            this.connectArgs.retry_strategy = function (options) {
-                if (options.error && options.error.code === 'ECONNREFUSED') {
-                    return new Error('The server refused the connection');
-                }
-                return Math.min(options.attempt * 100, 5000);
-            };
+            this.connectArgs.retry_strategy = retryStrategy;
+        }
+        if (this.connectArgs.enable_offline_queue === undefined) {
+            this.connectArgs.enable_offline_queue = false;
+        }
+        if (this.opts && this.opts.eventClient && !this.opts.eventClient.retry_strategy) {
+            this.opts.eventClient.retry_strategy = retryStrategy;
+        }
+        if (this.opts && this.opts.eventClient && this.opts.eventClient.enable_offline_queue === undefined) {
+            this.opts.eventClient.enable_offline_queue = false;
         }
         this._poolPtr = 0;
         this._pkKey = {};
@@ -35,7 +45,7 @@ var RedisAdapter = (function () {
         this._id = id;
     };
     RedisAdapter.prototype._key = function (table, pk) {
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             return table + "::" + String(pk);
         }
         else {
@@ -43,7 +53,7 @@ var RedisAdapter = (function () {
         }
     };
     RedisAdapter.prototype._getDB = function (table, increaseRetryCounter) {
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             return this._dbClients[table];
         }
         var db = this._dbPool[this._poolPtr];
@@ -57,25 +67,32 @@ var RedisAdapter = (function () {
         var _this = this;
         this._dbClients = {};
         this._dbPool = [];
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             this._dbPool.push(redis.createClient(this.connectArgs));
         }
         else {
-            for (var i = 0; i < 20; i++) {
+            var pSize = this.opts && this.opts.poolSize ? this.opts.poolSize : 10;
+            for (var i = 0; i < pSize; i++) {
                 this._dbPool.push(redis.createClient(this.connectArgs));
             }
         }
-        this._pub = redis.createClient(this.connectArgs);
-        this._sub = redis.createClient(this.connectArgs);
+        if (this.opts && this.opts.eventClient) {
+            this._pub = redis.createClient(this.opts.eventClient);
+            this._sub = redis.createClient(this.opts.eventClient);
+        }
+        else {
+            this._pub = redis.createClient(this.connectArgs);
+            this._sub = redis.createClient(this.connectArgs);
+        }
         var getIndexes = function () {
             _this.updateIndexes(true).then(function () {
                 complete();
-                if (_this.multipleDBs) {
+                if (_this.opts && _this.opts.multipleDBs) {
                     _this._dbPool[0].quit();
                 }
-                var hash = _this._clientID.split("").reduce(function (prev, cur) { return prev + cur.charCodeAt(0); }, 0) % 10;
+                var hash = _this._clientID.split("").reduce(function (prev, cur) { return prev + cur.charCodeAt(0); }, 0) % 59;
                 setInterval(function () {
-                    if (new Date().getMinutes() % 10 === hash && new Date().getSeconds() === hash * 5) {
+                    if (new Date().getMinutes() === hash && new Date().getSeconds() === hash) {
                         _this.updateIndexes();
                     }
                 }, 1000);
@@ -84,21 +101,13 @@ var RedisAdapter = (function () {
         utilities_1.fastALL([this._pub, this._sub].concat(this._dbPool), function (item, i, done) {
             if (item.connected) {
                 done();
+                return;
             }
             else {
                 item.on("ready", done);
             }
-            var doCheck = function () {
-                if (item.connected) {
-                    done();
-                }
-                else {
-                    setTimeout(doCheck, 50);
-                }
-            };
-            setTimeout(doCheck, 50);
         }).then(function () {
-            if (_this.multipleDBs) {
+            if (_this.opts && _this.opts.multipleDBs) {
                 _this._dbPool[0].get("_db_idx_", function (err, result) {
                     var dbIDX = result ? JSON.parse(result) : {};
                     var maxID = Object.keys(dbIDX).reduce(function (prev, cur) {
@@ -153,24 +162,27 @@ var RedisAdapter = (function () {
             });
         }
         else {
-            return utilities_1.fastCHAIN(Object.keys(this._dbIndex), function (table, i, next) {
+            return utilities_1.fastALL(Object.keys(this._dbIndex), function (table, i, next) {
                 var ptr = "0";
                 var index = [];
                 var getNextPage = function () {
                     _this._getDB(table).zscan(_this._key(table, "_index"), ptr, function (err, result) {
                         if (err)
                             throw err;
-                        if (!result[1].length) {
+                        if (!result[1].length && result[0] !== "0") {
                             ptr = result[0];
                             getNextPage();
+                            return;
                         }
                         if (result[0] === "0") {
-                            _this._dbIndex[table].set(index.sort(function (a, b) { return a > b ? 1 : -1; }));
+                            index = index.concat((result[1] || []).filter(function (v, i) { return i % 2 === 0; }));
+                            index = index.sort(function (a, b) { return a > b ? 1 : -1; });
+                            _this._dbIndex[table].set(index);
                             next();
                         }
                         else {
                             ptr = result[0];
-                            index = index.concat(result[1].filter(function (val, i) { return i % 2 === 0; }));
+                            index = index.concat((result[1] || []).filter(function (v, i) { return i % 2 === 0; }));
                             getNextPage();
                         }
                     });
@@ -202,11 +214,12 @@ var RedisAdapter = (function () {
         }
         var pkKey = this._pkKey[table];
         var isNum = ["float", "number", "int"].indexOf(this._pkType[table]) !== -1;
-        var doInsert = function (oldData) {
+        var doInsert = function () {
             if (_this._dbIndex[table].indexOf(pk) === -1) {
                 _this._dbIndex[table].add(pk);
                 _this._pub.publish("nsql", JSON.stringify({
                     source: _this._clientID,
+                    db: _this._id,
                     type: "add_idx",
                     event: {
                         table: table,
@@ -215,7 +228,7 @@ var RedisAdapter = (function () {
                 }));
             }
             _this._getDB(table).zadd(_this._key(table, "_index"), isNum ? pk : 0, String(pk));
-            var r = __assign({}, oldData, newData, (_a = {}, _a[_this._pkKey[table]] = pk, _a));
+            var r = __assign({}, newData, (_a = {}, _a[_this._pkKey[table]] = pk, _a));
             _this._getDB(table).set(_this._key(table, r[pkKey]), JSON.stringify(r), function (err, reply) {
                 if (err)
                     throw err;
@@ -224,12 +237,12 @@ var RedisAdapter = (function () {
             var _a;
         };
         if (pk) {
-            doInsert({});
+            doInsert();
         }
         else {
             this._getDB(table).incr(this._key(table, "_AI"), function (err, result) {
                 pk = result;
-                doInsert({});
+                doInsert();
             });
         }
     };
@@ -239,6 +252,7 @@ var RedisAdapter = (function () {
             this._dbIndex[table].remove(pk);
             this._pub.publish("nsql", JSON.stringify({
                 source: this._clientID,
+                db: this._id,
                 type: "rem_idx",
                 event: {
                     table: table,
@@ -258,7 +272,7 @@ var RedisAdapter = (function () {
             rows.push(row);
             next();
         }, function () {
-            callback(rows);
+            callback((rows || []).filter(function (r) { return r; }));
         });
     };
     RedisAdapter.prototype.read = function (table, pk, callback) {
@@ -314,7 +328,7 @@ var RedisAdapter = (function () {
                 if (err) {
                     throw err;
                 }
-                var rows = result.map(function (r) { return JSON.parse(r); }).sort(function (a, b) { return a[pkKey] > b[pkKey] ? 1 : -1; });
+                var rows = (result || []).filter(function (r) { return r; }).map(function (r) { return JSON.parse(r); }).sort(function (a, b) { return a[pkKey] > b[pkKey] ? 1 : -1; });
                 if (returnRows) {
                     done(rows);
                     return;
@@ -334,7 +348,8 @@ var RedisAdapter = (function () {
                 getRow();
             });
         };
-        if (keys.length < 100) {
+        var batchSize = this.opts && this.opts.batchSize ? this.opts.batchSize : 100;
+        if (keys.length < batchSize) {
             getBatch(keys, callback);
         }
         else {
@@ -342,7 +357,7 @@ var RedisAdapter = (function () {
             var batchKeyIdx = 0;
             batchKeys[0] = [];
             for (var i = 0; i < keys.length; i++) {
-                if (i > 0 && i % 100 === 0) {
+                if (i > 0 && i % batchSize === 0) {
                     batchKeyIdx++;
                     batchKeys[batchKeyIdx] = [];
                 }
@@ -376,6 +391,7 @@ var RedisAdapter = (function () {
             _this._dbIndex[table] = newIndex;
             _this._pub.publish("nsql", JSON.stringify({
                 source: _this._clientID,
+                db: _this._id,
                 type: "clr_idx",
                 event: {
                     table: table
@@ -391,7 +407,7 @@ var RedisAdapter = (function () {
     };
     RedisAdapter.prototype.destroy = function (complete) {
         var _this = this;
-        if (this.multipleDBs) {
+        if (this.opts && this.opts.multipleDBs) {
             utilities_1.fastALL(Object.keys(this._DBIds), function (table, i, done) {
                 _this._getDB(table).flushall(done);
             }).then(complete);
@@ -419,38 +435,42 @@ var RedisAdapter = (function () {
         this._sub.on("message", function (channel, msg) {
             var data = JSON.parse(msg);
             if (data.source !== _this._clientID) {
-                switch (data.type) {
-                    case "event":
-                        nsql.triggerEvent(data.event);
-                        break;
-                    case "pubsub":
-                        really_small_events_1.RSE.trigger(data.eventType, data.event);
-                        break;
-                    case "add_idx":
-                        if (!_this._dbIndex[data.event.table])
-                            return;
-                        _this._dbIndex[data.event.table].add(data.event.key);
-                        break;
-                    case "rem_idx":
-                        if (!_this._dbIndex[data.event.table])
-                            return;
-                        _this._dbIndex[data.event.table].remove(data.event.key);
-                        break;
-                    case "clr_idx":
-                        if (!_this._dbIndex[data.event.table])
-                            return;
-                        var newIndex = new db_idx_1.DatabaseIndex();
-                        newIndex.doAI = _this._dbIndex[data.event.table].doAI;
-                        _this._dbIndex[data.event.table] = newIndex;
-                        break;
+                if (data.type === "pubsub") {
+                    really_small_events_1.RSE.trigger(data.eventType, data.event);
+                    return;
+                }
+                if (data.db === _this._id) {
+                    switch (data.type) {
+                        case "event":
+                            nsql.triggerEvent(data.event);
+                            break;
+                        case "add_idx":
+                            if (!_this._dbIndex[data.event.table])
+                                return;
+                            _this._dbIndex[data.event.table].add(data.event.key);
+                            break;
+                        case "rem_idx":
+                            if (!_this._dbIndex[data.event.table])
+                                return;
+                            _this._dbIndex[data.event.table].remove(data.event.key);
+                            break;
+                        case "clr_idx":
+                            if (!_this._dbIndex[data.event.table])
+                                return;
+                            var newIndex = new db_idx_1.DatabaseIndex();
+                            newIndex.doAI = _this._dbIndex[data.event.table].doAI;
+                            _this._dbIndex[data.event.table] = newIndex;
+                            break;
+                    }
                 }
             }
         });
         this._sub.subscribe("nsql");
-        nsql.table("*").on("*", function (event) {
+        nsql.table("*").on(this.opts && this.opts.events ? this.opts.events.join(" ") : "change", function (event) {
             if (event.table && event.table.indexOf("_") !== 0) {
                 _this._pub.publish("nsql", JSON.stringify({
                     source: _this._clientID,
+                    db: _this._id,
                     type: "event",
                     event: __assign({}, event, { affectedRows: [] })
                 }));

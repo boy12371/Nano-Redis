@@ -4,7 +4,13 @@ import { Promise } from "lie-ts";
 import * as redis from "redis";
 export declare class RedisAdapter implements NanoSQLStorageAdapter {
     connectArgs: redis.ClientOpts;
-    multipleDBs: boolean | undefined;
+    opts: {
+        multipleDBs?: boolean | undefined;
+        eventClient?: redis.ClientOpts | undefined;
+        events?: string[] | undefined;
+        poolSize?: boolean | undefined;
+        batchSize?: number | undefined;
+    } | undefined;
     private _pkKey;
     private _pkType;
     private _dbIndex;
@@ -18,7 +24,13 @@ export declare class RedisAdapter implements NanoSQLStorageAdapter {
     private _mode;
     private _clientID;
     private _DBIds;
-    constructor(connectArgs: redis.ClientOpts, multipleDBs?: boolean | undefined);
+    constructor(connectArgs: redis.ClientOpts, opts?: {
+        multipleDBs?: boolean | undefined;
+        eventClient?: redis.ClientOpts | undefined;
+        events?: string[] | undefined;
+        poolSize?: boolean | undefined;
+        batchSize?: number | undefined;
+    } | undefined);
     setID(id: string): void;
     private _key(table, pk);
     private _getDB(table, increaseRetryCounter?);
